@@ -122,17 +122,18 @@ npm run preview
 | Export panel | ✗ | ✅ PDF explanation report, PDB/mmCIF coordinates, CSV, FASTA, and JSON |
 | Scientific limits notice | ✗ | ✅ `LimitsNotice` card, inline on result |
 | Session caching | ✗ | ✅ sessionStorage for PDB + prediction; avoids duplicate requests |
-| Rate limiting | ✗ | ✅ 60 requests/min/IP via backend middleware |
+| Rate limiting | ✗ | ✅ 60 requests/min/IP across prediction and structure endpoints |
 | Security headers | ✗ | ✅ CSP, HSTS, X-Content-Type-Options etc. |
-| Request size limit | ✗ | ✅ 64 KB hard limit on /api/predict |
+| Request size limit | ✗ | ✅ 64 KB hard limit, including chunked request bodies |
 | Uniform error envelopes | partial | ✅ `{"error": "...", "request_id": "..."}` on all errors |
-| Backend tests | 7 | 20 (validation, security headers, rate limit, context, coordinate formats) |
+| Backend tests | 7 | 25 (validation, security headers, rate limit, context, coordinate formats) |
 | npm vulnerabilities | 2 (esbuild, vite) | 0 (Vite 7, esbuild override) |
 
 ### Structure context and coordinate downloads
 
 | Endpoint | Purpose |
 |----------|---------|
+| `GET /health` | Lightweight deployment health check. |
 | `POST /api/structure/context` | Accepts a PDB ID, chain, and protein sequence; returns sourced RCSB/UniProt facts and sequence-search matches. Optional annotation failures are returned as warnings. |
 | `GET /api/pdb/{pdb_id}?format=pdb` | Download the PDB coordinate file. |
 | `GET /api/pdb/{pdb_id}?format=cif` | Download the mmCIF coordinate file, recommended for modern structures and larger atom/residue identifiers. |
@@ -212,7 +213,7 @@ npm run build      # Must produce dist/ with 0 errors
 
 ### Frontend (E2E — Playwright)
 
-> **Status:** E2E spec exists at `frontend/e2e/predictor.spec.ts` but could not be executed in this environment due to a Node.js 26 / `@playwright/test` compatibility issue (`utilsBundle.yauzl` undefined — `yauzl` moved to `zipBundle.js` in some builds). Manual browser verification is the current fallback.
+The Playwright configuration builds the frontend and runs the production preview on port 4173. It starts or reuses the backend on port 8000.
 
 To attempt E2E when Playwright is fixed:
 ```powershell
@@ -239,7 +240,7 @@ npm audit
 
 ## Environment variables
 
-Backend reads from `.env` (copy from `.env.example`):
+Backend settings are read from process environment variables. Railway/Render service settings are used in production; `.env.example` documents local values but Uvicorn does not load it automatically:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -249,6 +250,9 @@ Backend reads from `.env` (copy from `.env.example`):
 | `LOG_LEVEL` | `INFO` | Python log level |
 
 Sequences are **never logged** (research IP protection).
+If `RAILWAY_PUBLIC_DOMAIN` is set, its HTTPS origin is automatically included in CORS. For a separately hosted frontend, set `CORS_ORIGINS` to its exact HTTPS origin. Rate limiting is process-local; use a shared gateway or Redis-backed limiter if deploying multiple backend replicas.
+
+The application currently has no user accounts, admin area, database, or server-side user records. Prediction history and drafts remain in the visitor's browser storage, so database backups and account-level data isolation do not apply. Do not send confidential sequences to the structure-context endpoint: sequence-similarity searches are forwarded to RCSB.
 
 ---
 

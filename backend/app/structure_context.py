@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 import re
 from typing import Any
@@ -13,15 +14,30 @@ MAX_REMOTE_JSON_BYTES = 2_000_000
 UNIPROT_ACCESSION = re.compile(r"^[A-Z0-9]{6,10}(?:-\d+)?$")
 
 
-async def _get_json(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
-    response = await client.get(url)
-    response.raise_for_status()
-    if len(response.content) > MAX_REMOTE_JSON_BYTES:
-        raise ValueError("Remote annotation response exceeded the size limit.")
-    data = response.json()
+async def _request_json(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    async with client.stream(method, url, json=payload) as response:
+        response.raise_for_status()
+        content_length = response.headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > MAX_REMOTE_JSON_BYTES:
+            raise ValueError("Remote annotation response exceeded the size limit.")
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(body) + len(chunk) > MAX_REMOTE_JSON_BYTES:
+                raise ValueError("Remote annotation response exceeded the size limit.")
+            body.extend(chunk)
+    data = json.loads(body)
     if not isinstance(data, dict):
         raise ValueError("Remote annotation response was not a JSON object.")
     return data
+
+
+async def _get_json(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+    return await _request_json(client, "GET", url)
 
 
 def _text(value: Any, fallback: str = "") -> str:
@@ -67,11 +83,7 @@ async def _find_similar(
             "results_content_type": ["experimental"],
         },
     }
-    response = await client.post(RCSB_SEARCH, json=request)
-    response.raise_for_status()
-    if len(response.content) > MAX_REMOTE_JSON_BYTES:
-        raise ValueError("Similar-structure response exceeded the size limit.")
-    data = response.json()
+    data = await _request_json(client, "POST", RCSB_SEARCH, request)
     result_set = data.get("result_set", []) if isinstance(data, dict) else []
     matches: list[tuple[str, float]] = []
     for item in result_set:

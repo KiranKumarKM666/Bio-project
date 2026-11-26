@@ -1,4 +1,45 @@
 import type { ChainInfo, LigandSummary, PdbData, SS, AgreementStats, Residue } from './types';
+import { fetchWithTimeout } from './api';
+
+const MAX_PDB_BYTES = 10_000_000;
+
+async function readPdbText(response: Response): Promise<string> {
+  const contentLength = response.headers.get('content-length');
+  if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_PDB_BYTES) {
+    throw new Error('The downloaded structure exceeds the 10 MB limit.');
+  }
+  if (!response.body) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_PDB_BYTES) {
+      throw new Error('The downloaded structure exceeds the 10 MB limit.');
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_PDB_BYTES) {
+        await reader.cancel();
+        throw new Error('The downloaded structure exceeds the 10 MB limit.');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const blobParts: BlobPart[] = chunks.map((chunk) => {
+    const copy = new Uint8Array(chunk.byteLength);
+    copy.set(chunk);
+    return copy.buffer;
+  });
+  return new Blob(blobParts).text();
+}
 
 const THREE_TO_ONE: Record<string, string> = {
   ALA: 'A', ARG: 'R', ASN: 'N', ASP: 'D', CYS: 'C',
@@ -30,45 +71,30 @@ export async function fetchPdb(id: string, signal?: AbortSignal): Promise<string
     // SessionStorage may be restricted; proceed with network fetch
   }
 
-  let res: Response | null = null;
-  try {
-    res = await fetch(`https://files.rcsb.org/download/${cleanId}.pdb`, { signal });
-  } catch (err: unknown) {
-    if (err instanceof Error && err.name === 'AbortError') throw err;
-    // Fallback to backend proxy if direct RCSB fails
+  return fetchWithTimeout(signal, async (requestSignal) => {
+    let response: Response;
     try {
-      res = await fetch(`/api/pdb/${cleanId}`, { signal });
-    } catch {
+      response = await fetch(`/api/pdb/${cleanId}`, { signal: requestSignal });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') throw err;
       throw new Error(`Network error while downloading PDB entry ${cleanId}. Check your connection.`);
     }
-  }
 
-  if (!res || !res.ok) {
-    // If direct returned error, attempt backend proxy
-    try {
-      const proxyRes = await fetch(`/api/pdb/${cleanId}`, { signal });
-      if (proxyRes.ok) {
-        res = proxyRes;
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error(`PDB entry "${cleanId}" was not found on RCSB (HTTP 404). Check the accession ID.`);
       }
+      throw new Error(`RCSB download failed for ${cleanId} (HTTP ${response.status}).`);
+    }
+
+    const text = await readPdbText(response);
+    try {
+      sessionStorage.setItem(cacheKey, text);
     } catch {
-      // ignore proxy fallback error
+      // Storage quota exceeded or disabled
     }
-  }
-
-  if (!res || !res.ok) {
-    if (res?.status === 404) {
-      throw new Error(`PDB entry "${cleanId}" was not found on RCSB (HTTP 404). Check the accession ID.`);
-    }
-    throw new Error(`RCSB download failed for ${cleanId} (HTTP ${res?.status ?? 'Unknown'}).`);
-  }
-
-  const text = await res.text();
-  try {
-    sessionStorage.setItem(cacheKey, text);
-  } catch {
-    // Storage quota exceeded or disabled
-  }
-  return text;
+    return text;
+  });
 }
 
 interface ExperimentalRange {

@@ -1,5 +1,33 @@
 import type { PredictResponse, StructureContext } from './types';
 
+const REQUEST_TIMEOUT_MS = 10_000;
+
+export async function fetchWithTimeout<T>(
+  signal: AbortSignal | undefined,
+  request: (requestSignal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(signal?.reason);
+  if (signal?.aborted) {
+    abortFromCaller();
+  } else {
+    signal?.addEventListener('abort', abortFromCaller, { once: true });
+  }
+  const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    return await request(controller.signal);
+  } catch (error: unknown) {
+    if (controller.signal.aborted && !signal?.aborted) {
+      throw new Error('The request timed out after 10 seconds. Please try again.');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', abortFromCaller);
+  }
+}
+
 /** Computes a simple fast hash for sequence caching without external crypto libraries. */
 function hashString(str: string): string {
   let h = 0x811c9dc5;
@@ -92,51 +120,50 @@ export async function predict(sequence: string, signal?: AbortSignal): Promise<P
     // Storage restricted or corrupt; proceed with network request
   }
 
-  let res: Response;
-  try {
-    res = await fetch('/api/predict', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify({ sequence: cleanSeq }),
-      signal,
-    });
-  } catch (err: unknown) {
-    if (err instanceof Error && err.name === 'AbortError') {
-      throw err;
-    }
-    throw new Error('Cannot connect to the prediction server. Please verify the FastAPI backend is running on port 8000.');
-  }
-
-  if (!res.ok) {
-    let msg = `Prediction failed with status ${res.status}.`;
+  return fetchWithTimeout(signal, async (requestSignal) => {
+    let res: Response;
     try {
-      const body = await res.json();
-      if (typeof body.detail === 'string') {
-        msg = body.detail;
-      } else if (Array.isArray(body.detail) && body.detail[0]?.msg) {
-        msg = String(body.detail[0].msg).replace(/^Value error, /, '');
-      } else if (typeof body.message === 'string') {
-        msg = body.message;
-      }
-    } catch {
-      // Use fallback error message
+      res = await fetch('/api/predict', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({ sequence: cleanSeq }),
+        signal: requestSignal,
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+      throw new Error('Cannot connect to the prediction server. Please verify the FastAPI backend is running on port 8000.');
     }
-    throw new Error(msg);
-  }
 
-  const data: PredictResponse = await res.json();
+    if (!res.ok) {
+      let msg = `Prediction failed with status ${res.status}.`;
+      try {
+        const body = await res.json();
+        if (typeof body.detail === 'string') {
+          msg = body.detail;
+        } else if (Array.isArray(body.detail) && body.detail[0]?.msg) {
+          msg = String(body.detail[0].msg).replace(/^Value error, /, '');
+        } else if (typeof body.message === 'string') {
+          msg = body.message;
+        }
+      } catch {
+        // Keep the status-based message when the server does not return JSON.
+      }
+      throw new Error(msg);
+    }
 
-  // Save to session cache
-  try {
-    sessionStorage.setItem(cacheKey, JSON.stringify(data));
-  } catch {
-    // Storage full or unavailable
-  }
+    const data: PredictResponse = await res.json();
 
-  return data;
+    try {
+      sessionStorage.setItem(cacheKey, JSON.stringify(data));
+    } catch {
+      // Storage full or unavailable
+    }
+
+    return data;
+  });
 }
 
 export async function fetchStructureContext(
@@ -159,32 +186,34 @@ export async function fetchStructureContext(
     // Storage restrictions or corrupt cache do not block RCSB lookups.
   }
 
-  let response: Response;
-  try {
-    response = await fetch('/api/structure/context', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ pdb_id: cleanId, chain, sequence }),
-      signal,
-    });
-  } catch (error: unknown) {
-    if (error instanceof Error && error.name === 'AbortError') throw error;
-    throw new Error('Could not reach the structure-annotation service. The PDB viewer is still available.');
-  }
+  return fetchWithTimeout(signal, async (requestSignal) => {
+    let response: Response;
+    try {
+      response = await fetch('/api/structure/context', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ pdb_id: cleanId, chain, sequence }),
+        signal: requestSignal,
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === 'AbortError') throw error;
+      throw new Error('Could not reach the structure-annotation service. The PDB viewer is still available.');
+    }
 
-  if (!response.ok) {
-    throw new Error(await getApiError(response, `Structure annotations failed (${response.status}).`));
-  }
-  const data: unknown = await response.json();
-  if (!isStructureContext(data)) {
-    throw new Error('The structure-annotation service returned an unexpected response.');
-  }
-  try {
-    sessionStorage.setItem(cacheKey, JSON.stringify(data));
-  } catch {
-    // Storage quota or privacy settings do not block the current context.
-  }
-  return data;
+    if (!response.ok) {
+      throw new Error(await getApiError(response, `Structure annotations failed (${response.status}).`));
+    }
+    const data: unknown = await response.json();
+    if (!isStructureContext(data)) {
+      throw new Error('The structure-annotation service returned an unexpected response.');
+    }
+    try {
+      sessionStorage.setItem(cacheKey, JSON.stringify(data));
+    } catch {
+      // Storage quota or privacy settings do not block the current context.
+    }
+    return data;
+  });
 }
 
 export async function fetchStructureFile(
@@ -197,15 +226,17 @@ export async function fetchStructureFile(
     throw new Error('A valid four-character PDB ID is required for structure download.');
   }
 
-  let response: Response;
-  try {
-    response = await fetch(`/api/pdb/${cleanId}?format=${format}`, { signal });
-  } catch (error: unknown) {
-    if (error instanceof Error && error.name === 'AbortError') throw error;
-    throw new Error(`Could not download the ${format === 'cif' ? 'mmCIF' : 'PDB'} structure. Check the connection and try again.`);
-  }
-  if (!response.ok) {
-    throw new Error(await getApiError(response, `Structure download failed (${response.status}).`));
-  }
-  return response.blob();
+  return fetchWithTimeout(signal, async (requestSignal) => {
+    let response: Response;
+    try {
+      response = await fetch(`/api/pdb/${cleanId}?format=${format}`, { signal: requestSignal });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === 'AbortError') throw error;
+      throw new Error(`Could not download the ${format === 'cif' ? 'mmCIF' : 'PDB'} structure. Check the connection and try again.`);
+    }
+    if (!response.ok) {
+      throw new Error(await getApiError(response, `Structure download failed (${response.status}).`));
+    }
+    return response.blob();
+  });
 }

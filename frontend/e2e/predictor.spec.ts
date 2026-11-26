@@ -6,7 +6,7 @@ test.describe('Protein Secondary Structure Predictor E2E Flows', () => {
     await page.goto('/');
 
     // Check initial header
-    await expect(page.locator('h1')).toContainText('Protein Secondary Structure');
+    await expect(page.locator('h1')).toContainText('Protein structure explorer');
 
     // Click the 1UBQ benchmark chip
     const chip1UBQ = page.locator('button.chip', { hasText: '1UBQ' });

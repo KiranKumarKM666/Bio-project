@@ -29,6 +29,40 @@ def test_health_endpoint():
     assert data["version"] == "1.0.0"
 
 
+def test_railway_health_endpoint():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_production_health_headers(monkeypatch):
+    monkeypatch.setattr(main, "ENVIRONMENT", "production")
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
+    assert "script-src 'self'" in response.headers["Content-Security-Policy"]
+
+
+def test_unhandled_exception_returns_clean_error(monkeypatch):
+    def fail_prediction(sequence, predictor):
+        raise RuntimeError("sensitive internal detail")
+
+    monkeypatch.setattr(main, "predict", fail_prediction)
+    response = client.post(
+        "/api/predict",
+        json={"sequence": "AAAA"},
+        headers={"X-Request-ID": "test-request-123"},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": "InternalServerError",
+        "detail": "An unexpected server error occurred.",
+        "request_id": "test-request-123",
+    }
+    assert "sensitive internal detail" not in response.text
+
+
 def test_poly_ala_is_helix():
     assert set(labels("A" * 20)) == {"H"}
 
@@ -94,7 +128,13 @@ def test_security_headers_present():
     assert r.headers["X-Content-Type-Options"] == "nosniff"
     assert r.headers["Referrer-Policy"] == "no-referrer"
     assert r.headers["X-Frame-Options"] == "DENY"
-    assert "default-src 'none'" in r.headers["Content-Security-Policy"]
+    csp = r.headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp
+    assert "script-src 'self'" in csp
+    assert "style-src 'self' 'unsafe-inline'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "connect-src 'self'" in csp
+    assert "files.rcsb.org" not in csp
     assert "X-Request-ID" in r.headers
 
 
@@ -110,6 +150,16 @@ def test_payload_too_large_rejection():
     assert r.json()["error"] == "PayloadTooLarge"
 
 
+def test_payload_too_large_without_content_length():
+    response = client.post(
+        "/api/predict",
+        headers={"Transfer-Encoding": "chunked"},
+        content="A" * 70000,
+    )
+    assert response.status_code == 413
+    assert response.json()["error"] == "PayloadTooLarge"
+
+
 def test_rate_limiting():
     # 60 requests allowed, 61st triggers 429
     for _ in range(60):
@@ -119,6 +169,17 @@ def test_rate_limiting():
     over_limit = client.post("/api/predict", json={"sequence": "AAAA"})
     assert over_limit.status_code == 429
     assert over_limit.json()["error"] == "TooManyRequests"
+
+
+def test_rate_limiting_covers_external_structure_routes(monkeypatch):
+    monkeypatch.setattr(main, "RATE_LIMIT_MAX", 1)
+
+    first = client.get("/api/pdb/INVALID")
+    second = client.get("/api/pdb/INVALID")
+
+    assert first.status_code == 400
+    assert second.status_code == 429
+    assert second.json()["request_id"] == second.headers["X-Request-ID"]
 
 
 def test_glycine_formula_and_mass():
