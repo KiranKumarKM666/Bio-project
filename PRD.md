@@ -1,8 +1,8 @@
 # Product Requirements Document: Foldspace Protein Structure Explorer
 
-**Status:** Shipped  
-**Document date:** 2026-11-26  
-**Production website:** https://bio-project-production.up.railway.app/  
+**Status:** Shipped
+**Document date:** 2026-11-26
+**Production website:** https://bio-project-production.up.railway.app/
 **Product name:** Foldspace / Lab — Protein structure explorer
 
 ## 1. Product summary
